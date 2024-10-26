@@ -36,7 +36,7 @@ if __name__ == '__main__':
     paths = sort_all_files(find_all_images(args.indir))
 
     C = dcg.Context()
-    C.viewport.initialize(vsync=True, wait_for_input=True)
+    C.viewport.initialize(vsync=True, wait_for_input=True, title="Integrated Image Processing Viewer")
     ViewerWindow(C, paths, primary=True, no_bring_to_front_on_focus=True)
     #dcg.MetricsWindow(C)
     while C.running:
