@@ -1,0 +1,52 @@
+[build-system]
+requires = [
+    "wheel",
+    "click",
+    "setuptools",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name="iipv"
+version="0.0.1"
+dependencies = [
+    "dearcygui",
+    "imageio",
+    "numpy",
+]
+
+authors = [
+  {name = "Axel Davy"},
+]
+maintainers = [
+  {name = "Axel Davy"}
+]
+description="Integrate image sequence visualization into your Python project"
+readme = "README.md"
+license = {file = "LICENSE"}
+classifiers = [
+                'Development Status :: 2 - Pre-Alpha',
+                'Intended Audience :: Education',
+                'Intended Audience :: Developers',
+                'Intended Audience :: Science/Research',
+                'License :: OSI Approved :: MIT License',
+                'Operating System :: MacOS',
+                'Operating System :: Microsoft :: Windows :: Windows 10',
+                'Operating System :: POSIX',
+                'Operating System :: Unix',
+                'Programming Language :: Cython',
+                'Programming Language :: Python :: 3',
+                'Topic :: Software Development :: User Interfaces',
+                'Topic :: Software Development :: Libraries :: Python Modules'
+]
+
+
+[project.urls]
+Repository = "https://github.com/axeldavy/IntegratedImageProcessingViewer"
+
+[project.optional-dependencies]
+TIFF = ["tifffile"]
+LYCON = ["lycon"]
+
+[project.gui-scripts]
+iipv = "iipv:main"

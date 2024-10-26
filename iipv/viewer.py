@@ -4,7 +4,7 @@ import math
 import numpy as np
 import os
 import traceback
-from image_preloader import ImagePreloader
+from .image_preloader import ImagePreloader
 import time
 
 def DIVUP(a, b):
