@@ -53,7 +53,7 @@ class ImagePreloader:
     def __init__(self, cache_size_GB=2.):
         self.max_cache_size_B = cache_size_GB * (1024 ** 3)
         self.cache_size = 0
-        self.threadpool = ThreadPoolExecutorWithErrorMessage()
+        self.threadpool = ThreadPoolExecutorWithErrorMessage(max_workers=4)
         self.mutex = threading.Lock()
         self.cache = {}
         self.cache_insertion_order = deque()

@@ -3,6 +3,7 @@ import imageio
 import math
 import numpy as np
 import os
+import threading
 import traceback
 from .image_preloader import ImagePreloader
 import time
@@ -26,6 +27,9 @@ class ViewerImage(dcg.DrawInPlot):
         self.tiles = dict()
         self.margin = margin # spatial margin to load in advance
         self.should_fit = True
+        # We finish uploading the previous image before
+        # starting a new upload
+        self.update_mutex = threading.RLock()
 
     @property
     def transform(self):
@@ -45,86 +49,88 @@ class ViewerImage(dcg.DrawInPlot):
     @transform.setter
     def transform(self, value):
         self._transform = value
-        self.up_to_date_tiles.clear()
-        self.update_image()
+        with self.update_mutex:
+            self.up_to_date_tiles.clear()
+            self.update_image()
 
     def display(self, image):
         """Display an image, replacing any old one"""
-        if image is not self.image:
-            self.up_to_date_tiles.clear()
-        self.image = image
-        self.update_image()
+        with self.update_mutex:
+            if image is not self.image:
+                self.up_to_date_tiles.clear()
+            self.image = image
+            self.update_image()
 
     def update_image(self):
         """Update the image displayed if needed"""
-        h = self.image.shape[0]
-        w = self.image.shape[1]
-        if w == 0 or h == 0:
-            return
-        tiles_w = DIVUP(w, self.tile_size[1])
-        tiles_h = DIVUP(h, self.tile_size[0])
-        # TODO: configurable axes
-        X = self.parent.X1
-        Y = self.parent.Y1
-        min_x = X.min - self.margin
-        max_x = X.max + self.margin
-        min_y = Y.min - self.margin
-        max_y = Y.max + self.margin
-        if self.should_fit:
-            min_x = 0
-            max_x = w
-            min_y = 0
-            max_y = h
-        any_action = False
-        for i_w in range(tiles_w):
-            xm = i_w * self.tile_size[1]
-            xM = min(xm + self.tile_size[1], w)
-            if xM < min_x or xm > max_x:
-                continue
-            for i_h in range(tiles_h):
-                ym = i_h * self.tile_size[0]
-                yM = min(ym + self.tile_size[0], h)
-                if yM < min_y or ym > max_y:
+        with self.update_mutex:
+            h = self.image.shape[0]
+            w = self.image.shape[1]
+            if w == 0 or h == 0:
+                return
+            tiles_w = DIVUP(w, self.tile_size[1])
+            tiles_h = DIVUP(h, self.tile_size[0])
+            # TODO: configurable axes
+            X = self.parent.X1
+            Y = self.parent.Y1
+            min_x = X.min - self.margin
+            max_x = X.max + self.margin
+            min_y = Y.min - self.margin
+            max_y = Y.max + self.margin
+            if self.should_fit:
+                min_x = 0
+                max_x = w
+                min_y = 0
+                max_y = h
+            any_action = False
+            for i_w in range(tiles_w):
+                xm = i_w * self.tile_size[1]
+                xM = min(xm + self.tile_size[1], w)
+                if xM < min_x or xm > max_x:
                     continue
-                if (i_h, i_w) in self.up_to_date_tiles:
-                    continue
-                any_action = True
-                # Try to reuse existing textures if possible
-                prev_content = self.tiles.get((i_h, i_w), None)
-                if prev_content is None:
-                    # Initialize the image and its texture
-                    prev_content = dcg.DrawImage(self.context,
-                                                 parent=self,
-                                                 pmin=(xm, ym),
-                                                 pmax=(xM, yM))
-                    prev_content.texture = \
-                        dcg.Texture(self.context,
-                                    nearest_neighbor_upsampling=True)
-                    self.tiles[(i_h, i_w)] = prev_content
-                # Update max in case of change of size
-                prev_content.pmax = (xM, yM)
-                tile = self.image[ym:yM, xm:xM, ...]
-                #print(tile.shape, prev_content.pmin, prev_content.pmax)
-                # We don't use self._transform, so that the user
-                # can subclass and replace transform
-                try:
-                    processed_tile = self.transform(tile)
-                    #print(processed_tile)
-                    prev_content.texture.set_value(processed_tile)
-                except Exception:
-                    print(traceback.format_exc())
-                self.up_to_date_tiles.add((i_h, i_w))
-        # Free previous out of date tiles
-        out_of_date = [key for key in self.tiles.keys() if key not in self.up_to_date_tiles]
-        for key in out_of_date:
-            self.tiles[key].detach_item()
-            del self.tiles[key]
-        if self.should_fit:
-            X.fit()
-            Y.fit()
-            self.should_fit = False
-        if any_action:
-            self.context.viewport.wake() # Indicate content has changed
+                for i_h in range(tiles_h):
+                    ym = i_h * self.tile_size[0]
+                    yM = min(ym + self.tile_size[0], h)
+                    if yM < min_y or ym > max_y:
+                        continue
+                    if (i_h, i_w) in self.up_to_date_tiles:
+                        continue
+                    any_action = True
+                    # Try to reuse existing textures if possible
+                    prev_content = self.tiles.get((i_h, i_w), None)
+                    if prev_content is None:
+                        # Initialize the image and its texture
+                        prev_content = dcg.DrawImage(self.context,
+                                                     parent=self,
+                                                     pmin=(xm, ym),
+                                                     pmax=(xM, yM))
+                        prev_content.texture = \
+                            dcg.Texture(self.context,
+                                        nearest_neighbor_upsampling=True)
+                        self.tiles[(i_h, i_w)] = prev_content
+                    # Update max in case of change of size
+                    prev_content.pmax = (xM, yM)
+                    tile = self.image[ym:yM, xm:xM, ...]
+                    #print(tile.shape, prev_content.pmin, prev_content.pmax)
+                    # We don't use self._transform, so that the user
+                    # can subclass and replace transform
+                    try:
+                        processed_tile = self.transform(tile)
+                        prev_content.texture.set_value(processed_tile)
+                    except Exception:
+                        print(traceback.format_exc())
+                    self.up_to_date_tiles.add((i_h, i_w))
+            # Free previous out of date tiles
+            out_of_date = [key for key in self.tiles.keys() if key not in self.up_to_date_tiles]
+            for key in out_of_date:
+                self.tiles[key].detach_item()
+                del self.tiles[key]
+            if self.should_fit:
+                X.fit()
+                Y.fit()
+                self.should_fit = False
+            if any_action:
+                self.context.viewport.wake() # Indicate content has changed
 
 
 class ViewerElement(dcg.Plot):
