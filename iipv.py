@@ -38,7 +38,7 @@ if __name__ == '__main__':
     C = dcg.Context()
     C.viewport.initialize(vsync=True, wait_for_input=True)
     ViewerWindow(C, paths, primary=True, no_bring_to_front_on_focus=True)
-    dcg.MetricsWindow(C)
+    #dcg.MetricsWindow(C)
     while C.running:
         C.viewport.render_frame(can_skip_presenting=True)
     

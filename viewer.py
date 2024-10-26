@@ -98,17 +98,18 @@ class ViewerImage(dcg.DrawInPlot):
                                                  pmin=(xm, ym),
                                                  pmax=(xM, yM))
                     prev_content.texture = \
-                        dcg.Texture(self.context, 
+                        dcg.Texture(self.context,
                                     nearest_neighbor_upsampling=True)
                     self.tiles[(i_h, i_w)] = prev_content
                 # Update max in case of change of size
                 prev_content.pmax = (xM, yM)
                 tile = self.image[ym:yM, xm:xM, ...]
-                print(tile.shape, prev_content.pmin, prev_content.pmax)
+                #print(tile.shape, prev_content.pmin, prev_content.pmax)
                 # We don't use self._transform, so that the user
                 # can subclass and replace transform
                 try:
                     processed_tile = self.transform(tile)
+                    #print(processed_tile)
                     prev_content.texture.set_value(processed_tile)
                 except Exception:
                     print(traceback.format_exc())
@@ -133,7 +134,7 @@ class ViewerElement(dcg.Plot):
     def __init__(self, context, paths, index=0, reader=None, transform=None, **kwargs):
         super().__init__(context, **kwargs)
         self.paths = paths
-        self.current_index = index
+        self._index = index
         self.image_loader = reader if reader is not None else ImagePreloader()
         self.image_viewer = ViewerImage(context, parent=self)
         if transform is not None:
@@ -186,6 +187,22 @@ class ViewerElement(dcg.Plot):
         """
         return self.image_viewer.transform
 
+    @property
+    def num_images(self):
+        return len(self.paths)
+
+    @property
+    def index(self):
+        return self._index
+
+    @index.setter
+    def index(self, value):
+        value = max(0, min(self.num_images-1, value))
+        if self._index == value:
+            return
+        self._index = value
+        self.load_image()
+
     @transform.setter
     def transform(self, value):
         self.image_viewer.transform = value
@@ -194,7 +211,7 @@ class ViewerElement(dcg.Plot):
         self.image_viewer.update_image()
 
     def load_image(self):
-        path = self.paths[self.current_index]
+        path = self.paths[self._index]
         if isinstance(self.image_loader, ImagePreloader):
             self.image_loader.delayed_read(path, lambda result: self.image_viewer.display(result))
         else:
@@ -207,6 +224,7 @@ class ViewerWindow(dcg.Window):
     """
     def __init__(self, context, *paths_lists, **kwargs):
         super().__init__(context, **kwargs)
+        self.seqs = []
         for paths in paths_lists:
             self.add_sequence(paths)
         self.no_scroll_with_mouse = True
@@ -216,8 +234,24 @@ class ViewerWindow(dcg.Window):
             dcg.ThemeStyleImGui(context,
                                 WindowPadding=(0, 0),
                                 WindowBorderSize=0)
+        self.handlers += [
+            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Left, callback=self.index_down),
+            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Right, callback=self.index_up)
+        ]
 
     def add_sequence(self, paths):
         """Add a sequence represented by a list of paths"""
         # TODO: put in child window. Subplots
-        ViewerElement(self.context, paths, parent=self)
+        self.seqs.append(ViewerElement(self.context, paths, parent=self))
+
+    def index_down(self):
+        cur_index = max([seq.index for seq in self.seqs])
+        cur_index -= 1
+        for seq in self.seqs:
+            seq.index = cur_index
+
+    def index_up(self):
+        cur_index = max([seq.index for seq in self.seqs])
+        cur_index += 1
+        for seq in self.seqs:
+            seq.index = cur_index
