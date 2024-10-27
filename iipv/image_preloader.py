@@ -81,6 +81,7 @@ class ImagePreloader:
             self.cache[path] = image
             if is_cache:
                 self.cache_insertion_order.remove(path)
+            else:
                 self.cache_size += image.nbytes
             self.cache_insertion_order.append(path)
             # Free cache excess
