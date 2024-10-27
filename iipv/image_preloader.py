@@ -53,7 +53,7 @@ class ImagePreloader:
     def __init__(self, cache_size_GB=2.):
         self.max_cache_size_B = cache_size_GB * (1024 ** 3)
         self.cache_size = 0
-        self.threadpool = ThreadPoolExecutorWithErrorMessage(max_workers=4)
+        self.threadpool = ThreadPoolExecutorWithErrorMessage(max_workers=1)
         self.mutex = threading.Lock()
         self.cache = {}
         self.cache_insertion_order = deque()
@@ -66,7 +66,8 @@ class ImagePreloader:
         #if ext in ['.png', '.jpg'] and has_lycon:
         #    reader = tifffile.TiffReader(path)
         #    return lycon.TODO
-        return imageio.imread(path)
+        image = imageio.v3.imread(path, index=0)
+        return image
 
     def read_and_remember(self, path, callback):
         # Retrieve if in cache

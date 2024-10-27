@@ -1,12 +1,9 @@
 import dearcygui as dcg
-import imageio
 import math
 import numpy as np
-import os
 import threading
 import traceback
 from .image_preloader import ImagePreloader
-import time
 
 def DIVUP(a, b):
     return int(math.ceil( float(a) / float(b)))
@@ -18,6 +15,7 @@ class ViewerImage(dcg.DrawInPlot):
     def __init__(self, context, tile_size=[1024, 1024], margin=256, **kwargs):
         super().__init__(context, **kwargs)
         self.image = np.zeros([0, 0], dtype=np.int32)
+        self.scale = 1.
         self._transform = lambda x: x
         # Cut the image into tiles for display,
         # as we might show bigger images than
@@ -60,13 +58,21 @@ class ViewerImage(dcg.DrawInPlot):
             self.up_to_date_tiles_back.clear()
             self.update_image()
 
-    def display(self, image):
-        """Display an image, replacing any old one"""
+    def display(self, image, scale=1.):
+        """Display an image, replacing any old one
+        
+        Scale can be used to scale the image in regard
+        to the current axes coordinates.
+        For instance this can be used to display
+        a lower resolution image, which you will later
+        replace with the full image.
+        """
         with self.update_mutex:
             if image is not self.image:
                 self.up_to_date_tiles_front.clear()
                 self.up_to_date_tiles_back.clear()
             self.image = image
+            self.scale = scale
             self.update_image()
 
     def update_image(self):
@@ -74,6 +80,7 @@ class ViewerImage(dcg.DrawInPlot):
         with self.update_mutex:
             h = self.image.shape[0]
             w = self.image.shape[1]
+            scale = self.scale
             if w == 0 or h == 0:
                 return
             tiles_w = DIVUP(w, self.tile_size[1])
@@ -81,10 +88,10 @@ class ViewerImage(dcg.DrawInPlot):
             # TODO: configurable axes
             X = self.parent.X1
             Y = self.parent.Y1
-            min_x = X.min - self.margin
-            max_x = X.max + self.margin
-            min_y = Y.min - self.margin
-            max_y = Y.max + self.margin
+            min_x = (X.min - self.margin) / scale
+            max_x = (X.max + self.margin) / scale
+            min_y = (Y.min - self.margin) / scale
+            max_y = (Y.max + self.margin) / scale
             if self.should_fit:
                 min_x = 0
                 max_x = w
@@ -125,8 +132,8 @@ class ViewerImage(dcg.DrawInPlot):
                         # Initialize the image and its texture
                         prev_content = dcg.DrawImage(self.context,
                                                      parent=self.back,
-                                                     pmin=(xm, ym),
-                                                     pmax=(xM, yM))
+                                                     pmin=(xm*scale, ym*scale),
+                                                     pmax=(xM*scale, yM*scale))
                         prev_content.texture = \
                             dcg.Texture(self.context,
                                         nearest_neighbor_upsampling=True)
@@ -139,8 +146,8 @@ class ViewerImage(dcg.DrawInPlot):
                             prev_content.texture = \
                                 dcg.Texture(self.context,
                                             nearest_neighbor_upsampling=True)
-                    # Update max in case of change of size
-                    prev_content.pmax = (xM, yM)
+                        prev_content.pmin = (xm*scale, ym*scale)
+                        prev_content.pmax = (xM*scale, yM*scale)
                     # Already have a texture with up to date content. Take it
                     if (i_h, i_w) in self.up_to_date_tiles_front:
                         switched_textures[(i_h, i_w)] = prev_content.texture
@@ -148,7 +155,6 @@ class ViewerImage(dcg.DrawInPlot):
                         self.up_to_date_tiles_back.add((i_h, i_w))
                         continue
                     tile = self.image[ym:yM, xm:xM, ...]
-                    #print(tile.shape, prev_content.pmin, prev_content.pmax)
                     # We don't use self._transform, so that the user
                     # can subclass and replace transform
                     try:
@@ -192,11 +198,32 @@ class ViewerElement(dcg.Plot):
     """
     Sub-window to visualize one sequence of data
     """
-    def __init__(self, context, paths, index=0, reader=None, transform=None, **kwargs):
+    def __init__(self, context, paths, num_paths, reader, index=0, sub_index=0, transform=None, **kwargs):
+        """
+        paths: iterable (for example a list) of parameters to pass to the reader function
+        
+        num_paths: number of paths (len(paths) if paths is a list)
+        
+        reader: function to read the images
+        reader(paths[0]) reads image 0
+        reader(paths[1]) reads image 1
+        etc.
+        The returned image must be an ndarray of at least 2 dimensions.
+        Alternatively if paths[i] contains several sub-images, an
+        array (list, array of objects, etc) can be passed.
+        
+        transform: if not None, transform will be called on tiles
+        of the image.
+        The image tile after transform must be one of the following formats:
+        - 1, 2, 3 or 4 channels
+        - uint8 or float32. If float32, the data must be normalized between 0 and 1.
+        """
         super().__init__(context, **kwargs)
         self.paths = paths
+        self.num_images = num_paths
         self._index = index
-        self.image_loader = reader if reader is not None else ImagePreloader()
+        self._sub_index = sub_index
+        self.image_loader = reader
         self.image_viewer = ViewerImage(context, parent=self)
         if transform is not None:
             self.image_viewer.transform = transform
@@ -226,6 +253,14 @@ class ViewerElement(dcg.Plot):
         # fit whole size available
         self.width = -1
         self.height = -1
+        self.update_thread = threading.Thread(target=self.background_update, args=(), daemon=True)
+        self.update_request = threading.Event()
+        self.update_mutex = threading.Lock()
+        self.background_index = -1
+        self.background_subindex = -1
+        self.background_current_image = None
+        self.should_refresh = False
+        self.update_thread.start()
         # Set a handler to update the images when the plot min/max change
         self.handlers += [
             dcg.AxesResizeHandler(context, callback=self.on_resize)
@@ -249,10 +284,6 @@ class ViewerElement(dcg.Plot):
         return self.image_viewer.transform
 
     @property
-    def num_images(self):
-        return len(self.paths)
-
-    @property
     def index(self):
         return self._index
 
@@ -264,30 +295,80 @@ class ViewerElement(dcg.Plot):
         self._index = value
         self.load_image()
 
+    @property
+    def sub_index(self):
+        return self._sub_index
+
+    @sub_index.setter
+    def sub_index(self, value):
+        if self._sub_index == value:
+            return
+        self._sub_index = value
+        self.load_image()
+
     @transform.setter
     def transform(self, value):
         self.image_viewer.transform = value
 
+    def background_update(self):
+        """
+        Since reading the image and loading the texture can be slow,
+        do it in a background thread.
+        """
+        while True:
+            self.update_request.wait()
+            with self.update_mutex:
+                self.update_request.clear()
+                requested_index = self._index
+                requested_sub_index = self._sub_index
+                refresh_requested = self.should_refresh
+                self.should_refresh = False
+            full_refresh = False
+            image = None
+            if requested_index != self.background_index:
+                path = self.paths[requested_index]
+                self.background_index = requested_index
+                self.background_current_image = self.image_loader(path)
+                full_refresh = True
+            if isinstance(self.background_current_image, np.ndarray):
+                requested_sub_index = 0
+                image = self.background_current_image
+            else:
+                num_subimages = len(self.background_current_image)
+                requested_sub_index = max(0, min(num_subimages-1, requested_sub_index))
+                if requested_sub_index != self.background_subindex:
+                    image = self.background_current_image[requested_sub_index]
+                    full_refresh = True
+            if full_refresh:
+                self.image_viewer.display(image)
+            elif refresh_requested:
+                self.image_viewer.update_image()
+
     def on_resize(self, sender, target, data):
-        self.image_viewer.update_image()
+        with self.update_mutex:
+            self.should_refresh = True
+            self.update_request.set()
+
 
     def load_image(self):
-        path = self.paths[self._index]
-        if isinstance(self.image_loader, ImagePreloader):
-            self.image_loader.delayed_read(path, lambda result: self.image_viewer.display(result))
-        else:
-            self.image_viewer.display(self.image_loader(path))
+        with self.update_mutex:
+            self.update_request.set()
+        #path = self.paths[self._index]
+        #if isinstance(self.image_loader, ImagePreloader):
+        #    self.image_loader.delayed_read(path, lambda result: self.image_viewer.display(result))
+        #else:
+        #    self.image_viewer.display(self.image_loader(path))
 
 class ViewerWindow(dcg.Window):
     """
     Window instance with a menu to visualize one
     or multiple sequence of data.
     """
-    def __init__(self, context, *paths_lists, **kwargs):
+    def __init__(self, context, paths_lists, num_paths_per_item, readers, **kwargs):
         super().__init__(context, **kwargs)
         self.seqs = []
-        for paths in paths_lists:
-            self.add_sequence(paths)
+        for paths, num_paths, readers in zip(paths_lists, num_paths_per_item, readers):
+            self.add_sequence(paths, num_paths, readers)
         self.no_scroll_with_mouse = True
         self.no_scrollbar = True
         # Make the window content use the whole size
@@ -297,13 +378,15 @@ class ViewerWindow(dcg.Window):
                                 WindowBorderSize=0)
         self.handlers += [
             dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Left, callback=self.index_down),
-            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Right, callback=self.index_up)
+            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Right, callback=self.index_up),
+            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Down, callback=self.sub_index_down),
+            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Up, callback=self.sub_index_up)
         ]
 
-    def add_sequence(self, paths):
-        """Add a sequence represented by a list of paths"""
+    def add_sequence(self, paths, num_paths, reader):
+        """Adds a sequence represented by a list of paths"""
         # TODO: put in child window. Subplots
-        self.seqs.append(ViewerElement(self.context, paths, parent=self))
+        self.seqs.append(ViewerElement(self.context, paths, num_paths, reader, parent=self))
 
     def index_down(self):
         cur_index = max([seq.index for seq in self.seqs])
@@ -316,3 +399,15 @@ class ViewerWindow(dcg.Window):
         cur_index += 1
         for seq in self.seqs:
             seq.index = cur_index
+
+    def sub_index_down(self):
+        cur_index = max([seq.sub_index for seq in self.seqs])
+        cur_index -= 1
+        for seq in self.seqs:
+            seq.sub_index = cur_index
+
+    def sub_index_up(self):
+        cur_index = max([seq.sub_index for seq in self.seqs])
+        cur_index += 1
+        for seq in self.seqs:
+            seq.sub_index = cur_index

@@ -4,6 +4,8 @@ import imageio
 from natsort import natsorted
 import os
 from .viewer import ViewerWindow
+from .readers import SeriesReader
+import math
 
 def find_all_images(path):
     """
@@ -11,6 +13,12 @@ def find_all_images(path):
     we are supposed to be able to read
     """
     files = []
+    if not(os.path.isdir(path)):
+        _, extension = os.path.splitext(path)
+        if extension.lower() in imageio.config.known_extensions.keys():
+            return [path]
+        else:
+            return []
     for item in os.scandir(path):
         if item.is_dir():
             files += find_all_images(item)
@@ -29,7 +37,7 @@ def sort_all_files(files):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('indir', help=('Input directory'))
+    parser.add_argument('indir', help=('Input directory or file'))
     args = parser.parse_args()
 
     paths = sort_all_files(find_all_images(args.indir))
@@ -43,7 +51,13 @@ def main():
     # primary: use the whole window area
     # no_bring_to_front_on_focus: enables to have windows on top to
     # add your custom UI, and not have them hidden when clicking on the image.
-    ViewerWindow(C, paths, primary=True, no_bring_to_front_on_focus=True)
+    if len(paths) == 0:
+        raise ValueError("No compatible file found")
+    else:
+        reader = SeriesReader
+        num_images = len(paths)
+
+    ViewerWindow(C, [paths], [num_images], [reader], primary=True, no_bring_to_front_on_focus=True)
     while C.running:
         # can_skip_presenting: no GPU re-rendering on input that has no impact (such as mouse motion) 
         C.viewport.render_frame(can_skip_presenting=True)
