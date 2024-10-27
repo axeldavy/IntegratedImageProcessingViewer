@@ -23,10 +23,16 @@ class ViewerImage(dcg.DrawInPlot):
         # as we might show bigger images than
         # a texture can support
         self.tile_size = tile_size
-        self.up_to_date_tiles = set()
-        self.tiles = dict()
         self.margin = margin # spatial margin to load in advance
         self.should_fit = True
+        # Use double buffering as uploading the image
+        # to the gpu is not instantaneous
+        self.front = dcg.DrawingList(context, parent=self)
+        self.back = dcg.DrawingList(context, parent=self, show=False)
+        self.up_to_date_tiles_front = set()
+        self.up_to_date_tiles_back = set()
+        self.tiles_front = dict()
+        self.tiles_back = dict()
         # We finish uploading the previous image before
         # starting a new upload
         self.update_mutex = threading.RLock()
@@ -50,14 +56,16 @@ class ViewerImage(dcg.DrawInPlot):
     def transform(self, value):
         self._transform = value
         with self.update_mutex:
-            self.up_to_date_tiles.clear()
+            self.up_to_date_tiles_front.clear()
+            self.up_to_date_tiles_back.clear()
             self.update_image()
 
     def display(self, image):
         """Display an image, replacing any old one"""
         with self.update_mutex:
             if image is not self.image:
-                self.up_to_date_tiles.clear()
+                self.up_to_date_tiles_front.clear()
+                self.up_to_date_tiles_back.clear()
             self.image = image
             self.update_image()
 
@@ -93,23 +101,52 @@ class ViewerImage(dcg.DrawInPlot):
                     yM = min(ym + self.tile_size[0], h)
                     if yM < min_y or ym > max_y:
                         continue
-                    if (i_h, i_w) in self.up_to_date_tiles:
+                    if (i_h, i_w) in self.up_to_date_tiles_front:
                         continue
                     any_action = True
+            if not(any_action):
+                return
+            switched_textures = {}
+            for i_w in range(tiles_w):
+                xm = i_w * self.tile_size[1]
+                xM = min(xm + self.tile_size[1], w)
+                if xM < min_x or xm > max_x:
+                    continue
+                for i_h in range(tiles_h):
+                    ym = i_h * self.tile_size[0]
+                    yM = min(ym + self.tile_size[0], h)
+                    if yM < min_y or ym > max_y:
+                        continue
+                    if (i_h, i_w) in self.up_to_date_tiles_back:
+                        continue
                     # Try to reuse existing textures if possible
-                    prev_content = self.tiles.get((i_h, i_w), None)
+                    prev_content = self.tiles_back.get((i_h, i_w), None)
                     if prev_content is None:
                         # Initialize the image and its texture
                         prev_content = dcg.DrawImage(self.context,
-                                                     parent=self,
+                                                     parent=self.back,
                                                      pmin=(xm, ym),
                                                      pmax=(xM, yM))
                         prev_content.texture = \
                             dcg.Texture(self.context,
                                         nearest_neighbor_upsampling=True)
-                        self.tiles[(i_h, i_w)] = prev_content
+                        self.tiles_back[(i_h, i_w)] = prev_content
+                    else:
+                        if prev_content.texture.width != (xM-xm) or \
+                           prev_content.texture.height != (yM-ym):
+                            # Right now texture resize in DCG is slow
+                            # best to allocate a new one
+                            prev_content.texture = \
+                                dcg.Texture(self.context,
+                                            nearest_neighbor_upsampling=True)
                     # Update max in case of change of size
                     prev_content.pmax = (xM, yM)
+                    # Already have a texture with up to date content. Take it
+                    if (i_h, i_w) in self.up_to_date_tiles_front:
+                        switched_textures[(i_h, i_w)] = prev_content.texture
+                        prev_content.texture = self.tiles_front[(i_h, i_w)].texture
+                        self.up_to_date_tiles_back.add((i_h, i_w))
+                        continue
                     tile = self.image[ym:yM, xm:xM, ...]
                     #print(tile.shape, prev_content.pmin, prev_content.pmax)
                     # We don't use self._transform, so that the user
@@ -119,18 +156,36 @@ class ViewerImage(dcg.DrawInPlot):
                         prev_content.texture.set_value(processed_tile)
                     except Exception:
                         print(traceback.format_exc())
-                    self.up_to_date_tiles.add((i_h, i_w))
+                    self.up_to_date_tiles_back.add((i_h, i_w))
             # Free previous out of date tiles
-            out_of_date = [key for key in self.tiles.keys() if key not in self.up_to_date_tiles]
+            out_of_date = [key for key in self.tiles_back.keys() if key not in self.up_to_date_tiles_back]
             for key in out_of_date:
-                self.tiles[key].detach_item()
-                del self.tiles[key]
+                self.tiles_back[key].detach_item()
+                del self.tiles_back[key]
+            # Switch back and front
+            tmp = self.front
+            self.front = self.back
+            self.back = tmp
+            self.front.show = True
+            self.back.show = False
+            # Once the new back is not shown anymore, we can replace
+            # with the non-up to date textures.
+            for ((i_h, i_w), texture) in switched_textures.items():
+                self.tiles_front[(i_h, i_w)].texture = texture
+                self.up_to_date_tiles_front.remove((i_h, i_w))
+            tmp = self.tiles_front
+            self.tiles_front = self.tiles_back
+            self.tiles_back = tmp
+            tmp = self.up_to_date_tiles_front
+            self.up_to_date_tiles_front = self.up_to_date_tiles_back
+            self.up_to_date_tiles_back = tmp
+            # Fit if requested
             if self.should_fit:
                 X.fit()
                 Y.fit()
                 self.should_fit = False
-            if any_action:
-                self.context.viewport.wake() # Indicate content has changed
+            # Indicate content has changed (wait_for_input)
+            self.context.viewport.wake()
 
 
 class ViewerElement(dcg.Plot):
