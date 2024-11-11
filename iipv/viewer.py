@@ -260,6 +260,7 @@ class ViewerElement(dcg.Plot):
         self.background_subindex = -1
         self.background_current_image = None
         self.should_refresh = False
+        self.full_refresh = False
         self.update_thread.start()
         # Set a handler to update the images when the plot min/max change
         self.handlers += [
@@ -323,9 +324,10 @@ class ViewerElement(dcg.Plot):
                 requested_sub_index = self._sub_index
                 refresh_requested = self.should_refresh
                 self.should_refresh = False
-            full_refresh = False
+                full_refresh = self.full_refresh
+                self.full_refresh = False
             image = None
-            if requested_index != self.background_index:
+            if requested_index != self.background_index or full_refresh:
                 path = self.paths[requested_index]
                 self.background_index = requested_index
                 self.background_current_image = self.image_loader(path)
@@ -353,11 +355,11 @@ class ViewerElement(dcg.Plot):
     def load_image(self):
         with self.update_mutex:
             self.update_request.set()
-        #path = self.paths[self._index]
-        #if isinstance(self.image_loader, ImagePreloader):
-        #    self.image_loader.delayed_read(path, lambda result: self.image_viewer.display(result))
-        #else:
-        #    self.image_viewer.display(self.image_loader(path))
+
+    def refresh_image(self):
+        with self.update_mutex:
+            self.full_refresh = True
+            self.update_request.set()
 
 class ViewerWindow(dcg.Window):
     """
