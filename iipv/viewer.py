@@ -379,10 +379,10 @@ class ViewerWindow(dcg.Window):
                                 WindowPadding=(0, 0),
                                 WindowBorderSize=0)
         self.handlers += [
-            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Left, callback=self.index_down),
-            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Right, callback=self.index_up),
-            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Down, callback=self.sub_index_down),
-            dcg.KeyPressHandler(context, key=dcg.constants.mvKey_Up, callback=self.sub_index_up)
+            dcg.KeyPressHandler(context, key=dcg.Key.LEFTARROW, callback=self.index_down),
+            dcg.KeyPressHandler(context, key=dcg.Key.RIGHTARROW, callback=self.index_up),
+            dcg.KeyPressHandler(context, key=dcg.Key.DOWNARROW, callback=self.sub_index_down),
+            dcg.KeyPressHandler(context, key=dcg.Key.UPARROW, callback=self.sub_index_up)
         ]
 
     def add_sequence(self, paths, num_paths, reader):
