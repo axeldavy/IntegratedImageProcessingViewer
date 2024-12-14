@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+from appdirs import user_config_dir
 import dearcygui as dcg
 import math
 import numpy as np
@@ -34,6 +38,7 @@ class ViewerImage(dcg.DrawInPlot):
         # We finish uploading the previous image before
         # starting a new upload
         self.update_mutex = threading.RLock()
+        self._use_pixelwise_transform = True
 
     @property
     def transform(self):
@@ -57,6 +62,29 @@ class ViewerImage(dcg.DrawInPlot):
             self.up_to_date_tiles_front.clear()
             self.up_to_date_tiles_back.clear()
             self.update_image()
+
+    @property
+    def use_pixelwise_transform(self):
+        """Controls whether transforms are applied per-tile or globally.
+        
+        When True (default), transforms are applied to individual tiles, which is 
+        more memory efficient but may cause artifacts at tile boundaries for some 
+        transforms.
+        
+        When False, transforms are applied to the entire image at once before
+        tiling. This may be slower and use more memory but ensures consistency
+        across tile boundaries.
+        """
+        return self._use_pixelwise_transform
+        
+    @use_pixelwise_transform.setter 
+    def use_pixelwise_transform(self, value):
+        if self._use_pixelwise_transform != value:
+            self._use_pixelwise_transform = value
+            with self.update_mutex:
+                self.up_to_date_tiles_front.clear()
+                self.up_to_date_tiles_back.clear() 
+                self.update_image()
 
     def display(self, image, scale=1.):
         """Display an image, replacing any old one
@@ -113,6 +141,15 @@ class ViewerImage(dcg.DrawInPlot):
                     any_action = True
             if not(any_action):
                 return
+
+            # If using global transform, process entire image at once
+            global_processed = None
+            if not(self._use_pixelwise_transform) and self.image is not None:
+                try:
+                    global_processed = self.transform(self.image)
+                except Exception:
+                    print(traceback.format_exc())
+
             switched_textures = {}
             for i_w in range(tiles_w):
                 xm = i_w * self.tile_size[1]
@@ -154,14 +191,19 @@ class ViewerImage(dcg.DrawInPlot):
                         prev_content.texture = self.tiles_front[(i_h, i_w)].texture
                         self.up_to_date_tiles_back.add((i_h, i_w))
                         continue
-                    tile = self.image[ym:yM, xm:xM, ...]
-                    # We don't use self._transform, so that the user
-                    # can subclass and replace transform
-                    try:
-                        processed_tile = self.transform(tile)
-                        prev_content.texture.set_value(processed_tile)
-                    except Exception:
-                        print(traceback.format_exc())
+
+                    if global_processed is not None:
+                        # Use slice from globally processed image
+                        tile = global_processed[ym:yM, xm:xM, ...]
+                        prev_content.texture.set_value(tile)
+                    else:
+                        # Process tile individually
+                        tile = self.image[ym:yM, xm:xM, ...]
+                        try:
+                            processed_tile = self.transform(tile)
+                            prev_content.texture.set_value(processed_tile)
+                        except Exception:
+                            print(traceback.format_exc())
                     self.up_to_date_tiles_back.add((i_h, i_w))
             # Free previous out of date tiles
             out_of_date = [key for key in self.tiles_back.keys() if key not in self.up_to_date_tiles_back]
@@ -366,6 +408,7 @@ class ViewerWindow(dcg.Window):
     Window instance with a menu to visualize one
     or multiple sequence of data.
     """
+    seqs : list[ViewerElement]
     def __init__(self, context, paths_lists, num_paths_per_item, readers, **kwargs):
         super().__init__(context, **kwargs)
         self.seqs = []
@@ -373,17 +416,151 @@ class ViewerWindow(dcg.Window):
             self.add_sequence(paths, num_paths, readers)
         self.no_scroll_with_mouse = True
         self.no_scrollbar = True
-        # Make the window content use the whole size
+        
+        # Add menubar with transform editor
+        self.bar = dcg.MenuBar(context, parent=self)
+        with dcg.Menu(context, label="Edit", parent=self.bar):
+            dcg.MenuItem(context, label="Transform Editor", 
+                        callback=self.show_transform_editor)
+
+        # Add transform editor popup
+        self.transform_popup = dcg.Window(context, label="Transform Editor", 
+                                        show=False, modal=True,
+                                        no_open_over_existing_popup=False,
+                                        min_size=(600, 400), autosize=True)
+
+        # Add transform history
+        self.transform_history = TransformHistory()
+        
+        # Add editor components with navigation
+        with dcg.HorizontalLayout(context, parent=self.transform_popup):
+            dcg.Button(context, arrow=True, direction=dcg.ButtonDirection.LEFT, callback=self.prev_transform)
+            dcg.Button(context, arrow=True, direction=dcg.ButtonDirection.RIGHT, callback=self.next_transform)
+            dcg.Button(context, label="Reset", callback=self.reset_transform)
+        
+        
+        # Add editor components
+        self.transform_editor = dcg.InputText(context, 
+            parent=self.transform_popup,
+            multiline=True,
+            width=-1, height=320,
+            value=self.transform_history.get_current() or """def transform(image):
+    # Transform the image here
+    # image: numpy array of shape (H,W) or (H,W,C)
+    # return: uint8 array with 1-4 channels
+    return image""")
+
+        if not(self.transform_history.get_current()):
+            self.transform_history.add_transform(self.transform_editor.value)
+            
+        self.pixelwise_transform = dcg.Checkbox(context,
+            label="Pixelwise Transform",
+            value=True,
+            parent=self.transform_popup)
+            
+        with dcg.HorizontalLayout(context, parent=self.transform_popup):
+            dcg.Button(context, label="Apply", callback=self.apply_transform)
+            dcg.Button(context, label="Cancel", 
+                      callback=lambda: setattr(self.transform_popup, 'show', False))
+
+        # Theme and handlers setup
         self.theme = \
             dcg.ThemeStyleImGui(context,
                                 WindowPadding=(0, 0),
                                 WindowBorderSize=0)
-        self.handlers += [
+        key_handlers = \
+        [
             dcg.KeyPressHandler(context, key=dcg.Key.LEFTARROW, callback=self.index_down),
             dcg.KeyPressHandler(context, key=dcg.Key.RIGHTARROW, callback=self.index_up),
             dcg.KeyPressHandler(context, key=dcg.Key.DOWNARROW, callback=self.sub_index_down),
             dcg.KeyPressHandler(context, key=dcg.Key.UPARROW, callback=self.sub_index_up)
         ]
+        # Only take keys if the window has focus
+        self.handlers += [
+            dcg.ConditionalHandler(context, children=[
+                dcg.HandlerList(context, children=key_handlers),
+                dcg.FocusHandler(context)])
+        ]
+
+    def show_transform_editor(self):
+        """Show the transform editor popup"""
+        self.transform_popup.show = True
+
+    def prev_transform(self):
+        """Load previous transform from history"""
+        code = self.transform_history.go_prev()
+        if code:
+            self.transform_editor.value = code
+
+    def next_transform(self):
+        """Load next transform from history"""
+        code = self.transform_history.go_next()
+        if code:
+            self.transform_editor.value = code
+
+    def reset_transform(self):
+        """Reset transform to default"""
+        self.transform_editor.value = self.transform_history.reset()
+
+    def apply_transform(self):
+        """Validate and apply the transform function"""
+        try:
+            # Create a namespace to execute the code
+            namespace = {}
+            
+            # Add required imports
+            namespace.update({
+                'np': np,
+                'math': math
+            })
+            
+            # Execute the transform code
+            exec(self.transform_editor.value, namespace)
+            
+            # Validate the transform function exists
+            if 'transform' not in namespace:
+                raise ValueError("No transform function defined")
+                
+            # Try to apply it to validate it works
+            test_arr = np.zeros((10,10), dtype=np.uint8)
+            transform = namespace['transform']
+            result = transform(test_arr)
+            
+            if not isinstance(result, np.ndarray):
+                raise ValueError("Transform must return a numpy array")
+            
+            if result.dtype not in (np.uint8, np.float32, np.float64):
+                raise ValueError("Transform must return uint8 or float32 array")
+            if result.dtype in (np.float32, np.float64):
+                def normalize(x, f=transform):
+                    return (f(x) / 255).astype(np.float32)
+                transform = normalize
+
+            if len(result.shape) > 3 or (len(result.shape) == 3 and result.shape[2] > 4):
+                raise ValueError("Transform must return 1-4 channel image")
+
+            # If validation passed, save to history
+            self.transform_history.add_transform(self.transform_editor.value)
+
+            # Apply to all sequences
+            for seq in self.seqs:
+                seq.transform = transform
+                seq.image_viewer.use_pixelwise_transform = self.pixelwise_transform.value
+                seq.refresh_image()
+
+            # Remove any previous error message
+            if isinstance(self.transform_popup.children[-1], dcg.Text):
+                self.transform_popup.children[-1].detach_item()
+                
+            # Close popup
+            self.transform_popup.show = False
+            
+        except Exception as e:
+            # Remove any previous error message
+            if isinstance(self.transform_popup.children[-1], dcg.Text):
+                self.transform_popup.children[-1].detach_item()
+            with self.transform_popup:
+                dcg.Text(self.context, value=f"{str(e)}, {traceback.format_exc()}")
 
     def add_sequence(self, paths, num_paths, reader):
         """Adds a sequence represented by a list of paths"""
@@ -413,3 +590,80 @@ class ViewerWindow(dcg.Window):
         cur_index += 1
         for seq in self.seqs:
             seq.sub_index = cur_index
+
+class TransformHistory:
+    """Manages a history of image transforms with file persistence"""
+    
+    def __init__(self, config_dir=None):
+        if config_dir is None:
+            config_dir = user_config_dir("iipv")
+        self.config_dir = Path(config_dir)
+        self.config_file = self.config_dir / "transforms.json"
+        self.transforms = []
+        self.current_index = -1
+        self._load_transforms()
+
+    def _load_transforms(self):
+        """Load transforms from config file"""
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            if self.config_file.exists():
+                with open(self.config_file) as f:
+                    self.transforms = json.load(f)
+                self.current_index = len(self.transforms) - 1
+        except Exception as e:
+            print(f"Error loading transforms: {e}")
+            self.transforms = []
+            self.current_index = -1
+
+    def _save_transforms(self):
+        """Save transforms to config file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.transforms, f, indent=2)
+        except Exception as e:
+            print(f"Error saving transforms: {e}")
+
+    def add_transform(self, transform_code):
+        """Add a new transform to history"""
+        # Don't add if same as current
+        if self.transforms and transform_code == self.transforms[-1]:
+            return
+        # Remove any past duplicate
+        if transform_code in self.transforms:
+            self.transforms.remove(transform_code)
+
+        self.transforms.append(transform_code)
+        self.current_index = len(self.transforms) - 1
+        self._save_transforms()
+
+    def get_current(self):
+        """Get current transform code"""
+        if 0 <= self.current_index < len(self.transforms):
+            return self.transforms[self.current_index]
+        return None
+
+    def go_prev(self):
+        """Go to previous transform in history"""
+        if self.current_index > 0:
+            self.current_index -= 1
+            return self.get_current()
+        return None
+
+    def go_next(self):
+        """Go to next transform in history"""
+        if self.current_index < len(self.transforms) - 1:
+            self.current_index += 1
+            return self.get_current()
+        return None
+
+    def reset(self):
+        """Reset transform history to initial empty state"""
+        self.transforms = []
+        self.current_index = -1
+        self._save_transforms()
+        return """def transform(image):
+    # Transform the image here
+    # image: numpy array of shape (H,W) or (H,W,C)
+    # return: uint8 array with 1-4 channels
+    return image"""
