@@ -22,13 +22,6 @@ except Exception:
     pass
 
 
-def error_displaying_wrapper(obj, f, *args, **kwargs):
-    try:
-        f(*args, **kwargs)
-    except Exception:
-        print(f"{f} failed with arguments {args}, {kwargs}")
-        print(traceback.format_exc())
-
 class ThreadPoolExecutorWithErrorMessage(ThreadPoolExecutor):
     """A threadpool that doesn't fail silently"""
     def submit(f, *args, **kwargs):

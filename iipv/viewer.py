@@ -6,62 +6,118 @@ import dearcygui as dcg
 import math
 import numpy as np
 import threading
+import time
 import traceback
 from .image_preloader import ImagePreloader
+
+from concurrent.futures import ThreadPoolExecutor
 
 def DIVUP(a, b):
     return int(math.ceil( float(a) / float(b)))
 
-class ViewerImage(dcg.DrawInPlot):
+class AtomicCounter:
+    def __init__(self, value):
+        self._value = value
+        self._mutex = threading.Lock()
+        self._zero = threading.Event()
+        self._zero_time = 0.
+        if value <= 0:
+            self._zero_time = time.monotonic()
+            self._zero.set()
+
+    def dec(self):
+        with self._mutex:
+            self._value -= 1
+            if self._value <= 0:
+                self._zero_time = time.monotonic()
+                self._zero.set()
+            return self._value
+
+    def wait_for_zero(self):
+        self._zero.wait()
+
+    def timestamp_zero(self):
+        return self._zero_time
+
+def error_displaying_wrapper(f, *args, **kwargs):
+    try:
+        f(*args, **kwargs)
+    except Exception:
+        print(f"{f} failed with arguments {args}, {kwargs}")
+        print(traceback.format_exc())
+
+class ViewerImage(dcg.DrawingList):
     """
     Instance representing the image displayed
     """
-    def __init__(self, context, tile_size=[1024, 1024], margin=256, **kwargs):
+    def __init__(self, context,
+                 tile_size=[2048, 2048],
+                 margin=256, **kwargs):
         super().__init__(context, **kwargs)
-        self.image = np.zeros([0, 0], dtype=np.int32)
+        self.image = None
         self.scale = 1.
         self._transform = lambda x: x
         # Cut the image into tiles for display,
         # as we might show bigger images than
         # a texture can support
-        self.tile_size = tile_size
-        self.margin = margin # spatial margin to load in advance
-        self.should_fit = True
-        # Use double buffering as uploading the image
-        # to the gpu is not instantaneous
-        self.front = dcg.DrawingList(context, parent=self)
-        self.back = dcg.DrawingList(context, parent=self, show=False)
-        self.up_to_date_tiles_front = set()
-        self.up_to_date_tiles_back = set()
-        self.tiles_front = dict()
-        self.tiles_back = dict()
+        self._tile_size = tile_size
+        self._margin = margin # spatial margin to load in advance
+        self._use_pixelwise_transform = True
+        self._global_mutex = threading.RLock()
+        self._token_refresh = 0
+        self._visible_bounds = [0, 0, 1e9, 1e9]
+        # What is currently shown
+        self._displayed = dcg.DrawingList(context, parent=self)
+        self._up_to_date_tiles_displayed = set()
+        self._tiles_displayed = dict()
+        # What is being prepared
+        self._back = dcg.DrawingList(context, parent=self, show=False)
+        self._up_to_date_tiles_back = set()
+        self._tiles_back = dict()
+        self._image_back = np.zeros([0, 0], dtype=np.int32)
+        self._transformed_image_back = None
+        self._back_image_height = 0
+        self._back_image_width = 0
         # We finish uploading the previous image before
         # starting a new upload
-        self.update_mutex = threading.RLock()
-        self._use_pixelwise_transform = True
+        self._update_queue = ThreadPoolExecutor(max_workers=1)
 
     @property
     def transform(self):
         """
-        Function that is applied on tiles of the data
-        before displaying.
-        Output should be between 0 and 255,
-        and can be R (in that case displayed as gray),
-        RG (B is set to 0), RGB or RGBA.
-        R: single channel or no channel
-        RG: two channels
-        RGB/RGBA: three or four channels.
+        Function that is applied to the data before displaying.
         Expected output dtype is uint8 or float32.
+        For uint8, the output should be between 0 and 255,
+        and for float32 between 0 and 1.
+        The dimensions can be HxW or HxWxC.
+        The number of channels can be 1, 2, 3 or 4.
+        When the number of channels is 1, the image is displayed
+        as gray. When the number of channels is 2, the image is
+        displayed as RG. When the number of channels is 3 or 4,
+        the image is displayed as RGB or RGBA.
+
+        Input of transform:
+        If use_pixelwise_transform is False:
+            - One input: the image field passed to display(). May be an index.
+        If use_pixelwise_transform is True:
+            - If the image field passed to display() is an ndarray: the tile to transform.
+            - If the image field passed to display is not an array: the image field,
+              (for example an index), xm, xM, ym, yM (the coordinates of the tile to transform).
+        If the image field is not an array, the size of image is unknown,
+        thus transform might be called for undefined regions of the image.
+        In that case the corresponding crop of image may be returned, or None,
+        if the region if fully out of bounds.
         """
         return self._transform
 
+    def set_transform(self, value, counter=None):
+        self._transform = value
+        self.dirty()
+        return self.refresh(counter=counter)
+
     @transform.setter
     def transform(self, value):
-        self._transform = value
-        with self.update_mutex:
-            self.up_to_date_tiles_front.clear()
-            self.up_to_date_tiles_back.clear()
-            self.update_image()
+        self.set_transform(value)
 
     @property
     def use_pixelwise_transform(self):
@@ -76,17 +132,27 @@ class ViewerImage(dcg.DrawInPlot):
         across tile boundaries.
         """
         return self._use_pixelwise_transform
-        
-    @use_pixelwise_transform.setter 
-    def use_pixelwise_transform(self, value):
+
+    def set_use_pixelwise_transform(self, value, counter=None):
         if self._use_pixelwise_transform != value:
             self._use_pixelwise_transform = value
-            with self.update_mutex:
-                self.up_to_date_tiles_front.clear()
-                self.up_to_date_tiles_back.clear() 
-                self.update_image()
+            self.dirty()
+            return self.refresh(counter=counter)
 
-    def display(self, image, scale=1.):
+    @use_pixelwise_transform.setter
+    def use_pixelwise_transform(self, value):
+        self.set_use_pixelwise_transform(value)
+
+    def set_visible_bounds(self, bounds, counter=None):
+        """Set the visible bounds of the image (hint)
+        
+        bounds: [min_x, min_y, max_x, max_y]
+        """
+        with self._global_mutex:
+            self._visible_bounds = bounds
+        return self.refresh(counter=counter)
+
+    def display(self, image, scale=1., bounds=None, counter=None):
         """Display an image, replacing any old one
         
         Scale can be used to scale the image in regard
@@ -94,147 +160,278 @@ class ViewerImage(dcg.DrawInPlot):
         For instance this can be used to display
         a lower resolution image, which you will later
         replace with the full image.
+
+        image doesn't have to be a valid ndarray. It can be
+        an index used to convey to 'transform' the piece to read.
         """
-        with self.update_mutex:
-            if image is not self.image:
-                self.up_to_date_tiles_front.clear()
-                self.up_to_date_tiles_back.clear()
-            self.image = image
-            self.scale = scale
-            self.update_image()
+        self.image = image
+        self.scale = scale
+        if bounds is not None:
+            self._visible_bounds = bounds
+        return self.refresh(counter=counter)
 
-    def update_image(self):
+    def dirty(self):
+        """Mark the image as dirty, to make it update completly"""
+        with self._global_mutex:
+            self._up_to_date_tiles_back.clear()
+            self._up_to_date_tiles_displayed.clear()
+            self._transformed_image_back = None
+            self.max_w = 1e9 # Maximum estimated bound for the width
+            self.max_h = 1e9 # Maximum estimated bound for the height
+
+    def refresh(self, counter=None):
+        """Trigger a refresh of the image
+        counter: optional AtomicCounter instance to sync
+        the refresh with other elements.
+        """
+        with self._global_mutex:
+            self._token_refresh += 1
+            return self._update_queue.submit(error_displaying_wrapper,
+                                             self._background_update_image,
+                                             self._token_refresh,
+                                             self.image,
+                                             self.scale,
+                                             counter)
+
+    def _background_update_image(self, token, image, scale, counter):
         """Update the image displayed if needed"""
-        with self.update_mutex:
-            h = self.image.shape[0]
-            w = self.image.shape[1]
-            scale = self.scale
-            if w == 0 or h == 0:
+        if image is None:
+            return
+
+        # Retrieve the parameters
+        with self._global_mutex:
+            if token != self._token_refresh:
+                # Skip outdated refresh requests
                 return
-            tiles_w = DIVUP(w, self.tile_size[1])
-            tiles_h = DIVUP(h, self.tile_size[0])
-            # TODO: configurable axes
-            X = self.parent.X1
-            Y = self.parent.Y1
-            min_x = (X.min - self.margin) / scale
-            max_x = (X.max + self.margin) / scale
-            min_y = (Y.min - self.margin) / scale
-            max_y = (Y.max + self.margin) / scale
-            if self.should_fit:
-                min_x = 0
-                max_x = w
-                min_y = 0
-                max_y = h
-            any_action = False
-            for i_w in range(tiles_w):
-                xm = i_w * self.tile_size[1]
-                xM = min(xm + self.tile_size[1], w)
-                if xM < min_x or xm > max_x:
-                    continue
-                for i_h in range(tiles_h):
-                    ym = i_h * self.tile_size[0]
-                    yM = min(ym + self.tile_size[0], h)
-                    if yM < min_y or ym > max_y:
-                        continue
-                    if (i_h, i_w) in self.up_to_date_tiles_front:
-                        continue
-                    any_action = True
-            if not(any_action):
+            if image is not self._image_back:
+                # New image, clear all tile states
+                self._up_to_date_tiles_back.clear()
+                self._up_to_date_tiles_displayed.clear()
+                self._transformed_image_back = None
+                self._image_back = image
+                self._back_image_height = 1e9 # Maximum estimated bound for the width
+                self._back_image_width = 1e9
+            transform = self._transform
+            use_pixelwise_transform = self._use_pixelwise_transform
+            transformed_image = self._transformed_image_back
+            margin = self._margin
+            tile_size = self._tile_size
+            visible_bounds = self._visible_bounds
+            min_x = (visible_bounds[0] - margin) / scale
+            max_x = (visible_bounds[2] + margin) / scale
+            min_y = (visible_bounds[1] - margin) / scale
+            max_y = (visible_bounds[3] + margin) / scale
+
+        # If using a global transform, process the entire image at once
+        if not(use_pixelwise_transform) and transformed_image is None:
+            try:
+                transformed_image = transform(image)
+                with self._global_mutex:
+                    self._transformed_image_back = transformed_image
+            except Exception:
+                print("Error while running the image transform: ", traceback.format_exc())
+            
+        if transformed_image is not None:
+            max_h, max_w = transformed_image.shape[:2]
+        elif hasattr(image, 'shape'):
+            # if transformed_image is defined, 
+            # prefer to use it instead of the image data.
+            max_h, max_w = image.shape[:2]
+        else:
+            max_w = self._back_image_width
+            max_h = self._back_image_height
+        if max_h == 0 or max_w == 0:
+            return
+        min_x = max(0, min_x)
+        min_y = max(0, min_y)
+        max_x = min(max_w, max_x)
+        max_y = min(max_h, max_y)
+
+        num_tiles_w = DIVUP(max_x, tile_size[1])
+        num_tiles_h = DIVUP(max_y, tile_size[0])
+        if max_x > 1e9:
+            # Check if the visible tiles are already up to date to skip computation
+            any_action = any(
+                (i_h, i_w) not in self._up_to_date_tiles_displayed
+                for i_w in range(num_tiles_w)
+                for i_h in range(num_tiles_h)
+                if not (i_w * tile_size[1] > max_x or (i_w + 1) * tile_size[1] < min_x or
+                        i_h * tile_size[0] > max_y or (i_h + 1) * tile_size[0] < min_y)
+            )
+            if not any_action:
                 return
 
-            # If using global transform, process entire image at once
-            global_processed = None
-            if not(self._use_pixelwise_transform) and self.image is not None:
-                try:
-                    global_processed = self.transform(self.image)
-                except Exception:
-                    print(traceback.format_exc())
-
-            switched_textures = {}
-            for i_w in range(tiles_w):
-                xm = i_w * self.tile_size[1]
-                xM = min(xm + self.tile_size[1], w)
-                if xM < min_x or xm > max_x:
+        for i_w in range(num_tiles_w):
+            xm = i_w * tile_size[1]
+            xM = min(xm + tile_size[1], max_w)
+            if xM < min_x:
+                # Only update visible parts
+                continue
+            if xm >= min(max_x, max_w):
+                break
+            for i_h in range(num_tiles_h):
+                ym = i_h * tile_size[0]
+                yM = min(ym + tile_size[0], max_h)
+                if yM < min_y:
+                    # Only update visible parts
                     continue
-                for i_h in range(tiles_h):
-                    ym = i_h * self.tile_size[0]
-                    yM = min(ym + self.tile_size[0], h)
-                    if yM < min_y or ym > max_y:
-                        continue
-                    if (i_h, i_w) in self.up_to_date_tiles_back:
-                        continue
-                    # Try to reuse existing textures if possible
-                    prev_content = self.tiles_back.get((i_h, i_w), None)
-                    if prev_content is None:
-                        # Initialize the image and its texture
-                        prev_content = dcg.DrawImage(self.context,
-                                                     parent=self.back,
-                                                     pmin=(xm*scale, ym*scale),
-                                                     pmax=(xM*scale, yM*scale))
-                        prev_content.texture = \
-                            dcg.Texture(self.context,
-                                        nearest_neighbor_upsampling=True)
-                        self.tiles_back[(i_h, i_w)] = prev_content
-                    else:
-                        if prev_content.texture.width != (xM-xm) or \
-                           prev_content.texture.height != (yM-ym):
-                            # Right now texture resize in DCG is slow
-                            # best to allocate a new one
-                            prev_content.texture = \
-                                dcg.Texture(self.context,
-                                            nearest_neighbor_upsampling=True)
-                        prev_content.pmin = (xm*scale, ym*scale)
-                        prev_content.pmax = (xM*scale, yM*scale)
-                    # Already have a texture with up to date content. Take it
-                    if (i_h, i_w) in self.up_to_date_tiles_front:
-                        switched_textures[(i_h, i_w)] = prev_content.texture
-                        prev_content.texture = self.tiles_front[(i_h, i_w)].texture
-                        self.up_to_date_tiles_back.add((i_h, i_w))
-                        continue
+                if ym >= min(max_y, max_h):
+                    break
+                if (i_h, i_w) in self._up_to_date_tiles_back:
+                    # back already up to date
+                    continue
+                # Try to reuse existing textures if possible
+                draw_tile = self._tiles_back.get((i_h, i_w), None)
+                if draw_tile is None or \
+                    draw_tile.texture.width != (xM-xm) or \
+                    draw_tile.texture.height != (yM-ym):
+                    # Initialize the image and its texture
+                    draw_tile = \
+                        dcg.DrawImage(self.context,
+                                      parent=self._back,
+                                      texture=\
+                                         dcg.Texture(self.context,
+                                                     dynamic=True,
+                                                     nearest_neighbor_upsampling=True))
+                    if (i_h, i_w) in self._tiles_back:
+                        self._tiles_back[(i_h, i_w)].detach_item()
+                    self._tiles_back[(i_h, i_w)] = draw_tile
 
-                    if global_processed is not None:
-                        # Use slice from globally processed image
-                        tile = global_processed[ym:yM, xm:xM, ...]
-                        prev_content.texture.set_value(tile)
-                    else:
+                # Configure the DrawImage and the Texture
+                draw_tile.pmin = (xm*scale, ym*scale)
+                draw_tile.pmax = (xM*scale, yM*scale)
+                draw_tile.show = True
+                # Already have a texture with up to date content. Take it
+                with self._global_mutex:
+                    if (i_h, i_w) in self._up_to_date_tiles_displayed:
+                        visible_tile = self._tiles_displayed[(i_h, i_w)]
+                        draw_tile.texture = visible_tile.texture
+                        draw_tile.pmax = visible_tile.pmax
+                        draw_tile.show = visible_tile.show
+                        self._up_to_date_tiles_back.add((i_h, i_w))
+                        continue
+                # Dirty tile, update it
+                if not(use_pixelwise_transform):
+                    # global transform:
+                    # Use slice from globally processed image
+                    tile = transformed_image[ym:yM, xm:xM, ...]
+                    draw_tile.texture.set_value(tile)
+                else:
+                    # tile processing
+                    if hasattr(image, 'shape'):
                         # Process tile individually
-                        tile = self.image[ym:yM, xm:xM, ...]
+                        tile = image[ym:yM, xm:xM, ...]
                         try:
-                            processed_tile = self.transform(tile)
-                            prev_content.texture.set_value(processed_tile)
+                            processed_tile = transform(tile)
+                            draw_tile.texture.set_value(processed_tile)
                         except Exception:
-                            print(traceback.format_exc())
-                    self.up_to_date_tiles_back.add((i_h, i_w))
-            # Free previous out of date tiles
-            out_of_date = [key for key in self.tiles_back.keys() if key not in self.up_to_date_tiles_back]
-            for key in out_of_date:
-                self.tiles_back[key].detach_item()
-                del self.tiles_back[key]
-            # Switch back and front
-            tmp = self.front
-            self.front = self.back
-            self.back = tmp
-            self.front.show = True
-            self.back.show = False
-            # Once the new back is not shown anymore, we can replace
-            # with the non-up to date textures.
-            for ((i_h, i_w), texture) in switched_textures.items():
-                self.tiles_front[(i_h, i_w)].texture = texture
-                self.up_to_date_tiles_front.remove((i_h, i_w))
-            tmp = self.tiles_front
-            self.tiles_front = self.tiles_back
-            self.tiles_back = tmp
-            tmp = self.up_to_date_tiles_front
-            self.up_to_date_tiles_front = self.up_to_date_tiles_back
-            self.up_to_date_tiles_back = tmp
-            # Fit if requested
-            if self.should_fit:
-                X.fit()
-                Y.fit()
-                self.should_fit = False
-            # Indicate content has changed (wait_for_input)
-            self.context.viewport.wake()
+                            print("Error while running the image transform: ", traceback.format_exc())
+                            draw_tile.texture.set_value(np.zeros((yM-ym, xM-xm, 4), dtype=np.uint8))
+                    else:
+                        # Fetch the tile
+                        try:
+                            tile = transform(image, xm, xM, ym, yM)
+                            if tile is not None:
+                                if tile.shape[1] < tile_size[1]:
+                                    max_w = min(max_w, xm + tile.shape[1])
+                                    draw_tile.pmax = (max_w*scale, draw_tile.pmax[1])
+                                if tile.shape[0] < tile_size[0]:
+                                    max_h = min(max_h, ym + tile.shape[0])
+                                    draw_tile.pmax = (draw_tile.pmax[0], max_h*scale)
+                                draw_tile.texture.set_value(tile)
+                            else:
+                                # Completly outside the image
+                                max_h = min(max_h, ym)
+                                max_w = min(max_w, xm)
+                                # Set transparent content
+                                #draw_tile.texture.set_value(np.zeros((yM-ym, xM-xm, 4), dtype=np.uint8))
+                                draw_tile.show = False
+                        except Exception:
+                            print("Error while running the image transform: ", traceback.format_exc())
+                            #draw_tile.texture.set_value(np.zeros((yM-ym, xM-xm, 4), dtype=np.uint8))
+                            draw_tile.show = False
+                self._up_to_date_tiles_back.add((i_h, i_w))
+        self._back_image_width = max_w
+        self._back_image_height = max_h
+        # Hide out of bound tiles
+        out_of_date = [key for key in self._tiles_back.keys() if key not in self._up_to_date_tiles_back]
+        for key in out_of_date:
+            self._tiles_back[key].show = False
+        if isinstance(counter, AtomicCounter):
+            counter.dec()
+            # Wait all updates are done
+            counter.wait_for_zero()
+        self._swap_back()
 
+    def _swap_back(self):
+        """Swap the back and displayed images"""
+        with self._global_mutex:
+            tmp = self._displayed
+            self._displayed = self._back
+            self._back = tmp
+            tmp = self._tiles_displayed
+            self._tiles_displayed = self._tiles_back
+            self._tiles_back = tmp
+            tmp = self._up_to_date_tiles_displayed
+            self._up_to_date_tiles_displayed = self._up_to_date_tiles_back
+            self._up_to_date_tiles_back = tmp
+            # Swap atomically
+            with self.mutex:
+                self._displayed.show = True
+                self._back.show = False
+        # Indicate content has changed (wait_for_input)
+        self.context.viewport.wake()
+
+class ViewerImageInPlot(dcg.DrawInPlot):
+    """
+    A viewer image that automatically update the
+    image according to the target axes bounds.
+    """
+    def __init__(self, context, **kwargs):
+        super().__init__(context, **kwargs)
+        # Create the ViewerImage as a child
+        self.viewer = ViewerImage(context, parent=self)
+        # Add handler to update image when plot axes change
+        self.parent.handlers += [
+            dcg.AxesResizeHandler(context,
+                                  axes = self.axes,
+                                  callback=self.on_axes_resize)
+        ]
+
+    @property 
+    def transform(self):
+        return self.viewer.transform
+
+    @transform.setter
+    def transform(self, value):
+        self.viewer.transform = value
+
+    @property
+    def use_pixelwise_transform(self):
+        return self.viewer.use_pixelwise_transform
+
+    @use_pixelwise_transform.setter
+    def use_pixelwise_transform(self, value):
+        self.viewer.use_pixelwise_transform = value
+
+    def dirty(self):
+        """Mark the image as dirty, to make it update completly"""
+        return self.viewer.dirty()
+
+    def refresh(self, counter=None):
+        """Refresh the displayed image"""
+        return self.viewer.refresh(counter=counter)
+
+    def display(self, image, scale=1., counter=None):
+        """Display a new image"""
+        # Get current plot bounds
+        return self.viewer.display(image, scale, None, counter)
+
+    def on_axes_resize(self, sender, target, data):
+        """Handler callback for axes resize events"""
+        # Get current plot bounds from resize data
+        ((xmin, xmax, _), (ymin, ymax, _)) = data
+        self.viewer.set_visible_bounds([xmin, ymin, xmax, ymax])
 
 class ViewerElement(dcg.Plot):
     """
@@ -261,14 +458,6 @@ class ViewerElement(dcg.Plot):
         - uint8 or float32. If float32, the data must be normalized between 0 and 1.
         """
         super().__init__(context, **kwargs)
-        self.paths = paths
-        self.num_images = num_paths
-        self._index = index
-        self._sub_index = sub_index
-        self.image_loader = reader
-        self.image_viewer = ViewerImage(context, parent=self)
-        if transform is not None:
-            self.image_viewer.transform = transform
         # Disable all plot features we don't want
         self.X1.no_label = True
         self.X1.no_gridlines = True
@@ -295,22 +484,20 @@ class ViewerElement(dcg.Plot):
         # fit whole size available
         self.width = -1
         self.height = -1
-        self.update_thread = threading.Thread(target=self.background_update, args=(), daemon=True)
-        self.update_request = threading.Event()
-        self.update_mutex = threading.Lock()
-        self.background_index = -1
-        self.background_subindex = -1
-        self.background_current_image = None
-        self.should_refresh = False
-        self.full_refresh = False
-        self.update_thread.start()
-        # Set a handler to update the images when the plot min/max change
-        self.handlers += [
-            dcg.AxesResizeHandler(context, callback=self.on_resize)
-        ]
         # Remove empty borders
         self.theme = dcg.ThemeStyleImPlot(self.context, PlotPadding=(0, 0))
-        self.load_image()
+        # Custom fields
+        self.paths = paths
+        self.num_images = num_paths
+        self._index = index
+        self._sub_index = sub_index
+        self.image_loader = reader
+        self._current_index = None
+        self._current_sub_index = None
+        self._current_image = None
+        self._current_subimage = None
+        self.image_viewer = ViewerImageInPlot(context, parent=self)
+        self.transform = transform
 
     @property
     def transform(self):
@@ -324,7 +511,7 @@ class ViewerElement(dcg.Plot):
         RG: two channels
         RGB/RGBA: three or four channels
         """
-        return self.image_viewer.transform
+        return self.image_transform
 
     @property
     def index(self):
@@ -336,7 +523,7 @@ class ViewerElement(dcg.Plot):
         if self._index == value:
             return
         self._index = value
-        self.load_image()
+        self.image_viewer.display((self._index, self._sub_index))
 
     @property
     def sub_index(self):
@@ -347,61 +534,42 @@ class ViewerElement(dcg.Plot):
         if self._sub_index == value:
             return
         self._sub_index = value
-        self.load_image()
+        self.image_viewer.display((self._index, self._sub_index))
+
+    def load_and_transform(self, index_pair, xm, xM, ym, yM):
+        index, sub_index = index_pair
+        if index != self._current_index:
+            image = self.image_loader(self.paths[index])
+            self._current_image = image
+            self._current_index = index
+            self._current_sub_index = None
+        else:
+            image = self._current_image
+        if sub_index != self._current_sub_index:
+            if isinstance(image, np.ndarray):
+                sub_index = 0
+            else:
+                num_subimages = len(image)
+                sub_index = max(0, min(num_subimages-1, sub_index))
+                image = image[sub_index]
+            self._current_subimage = image
+            self._current_sub_index = sub_index
+        image = self._current_subimage
+        if xm >= image.shape[1] or ym >= image.shape[0]:
+            return None
+        xM = min(image.shape[1], xM)
+        yM = min(image.shape[0], yM)
+        image = image[ym:yM, xm:xM, ...]
+        if self.image_transform is not None:
+            return self.image_transform(image)
+        return image
 
     @transform.setter
     def transform(self, value):
-        self.image_viewer.transform = value
+        self.image_transform = value
+        self.image_viewer.transform = self.load_and_transform
+        self.image_viewer.display((self._index, self._sub_index))
 
-    def background_update(self):
-        """
-        Since reading the image and loading the texture can be slow,
-        do it in a background thread.
-        """
-        while True:
-            self.update_request.wait()
-            with self.update_mutex:
-                self.update_request.clear()
-                requested_index = self._index
-                requested_sub_index = self._sub_index
-                refresh_requested = self.should_refresh
-                self.should_refresh = False
-                full_refresh = self.full_refresh
-                self.full_refresh = False
-            image = None
-            if requested_index != self.background_index or full_refresh:
-                path = self.paths[requested_index]
-                self.background_index = requested_index
-                self.background_current_image = self.image_loader(path)
-                full_refresh = True
-            if isinstance(self.background_current_image, np.ndarray):
-                requested_sub_index = 0
-                image = self.background_current_image
-            else:
-                num_subimages = len(self.background_current_image)
-                requested_sub_index = max(0, min(num_subimages-1, requested_sub_index))
-                if requested_sub_index != self.background_subindex:
-                    image = self.background_current_image[requested_sub_index]
-                    full_refresh = True
-            if full_refresh:
-                self.image_viewer.display(image)
-            elif refresh_requested:
-                self.image_viewer.update_image()
-
-    def on_resize(self, sender, target, data):
-        with self.update_mutex:
-            self.should_refresh = True
-            self.update_request.set()
-
-
-    def load_image(self):
-        with self.update_mutex:
-            self.update_request.set()
-
-    def refresh_image(self):
-        with self.update_mutex:
-            self.full_refresh = True
-            self.update_request.set()
 
 class ViewerWindow(dcg.Window):
     """
