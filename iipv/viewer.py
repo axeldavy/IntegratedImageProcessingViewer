@@ -291,7 +291,7 @@ class ViewerImage(dcg.DrawingList):
                                       parent=self._back,
                                       texture=\
                                          dcg.Texture(self.context,
-                                                     dynamic=True,
+                                                     hint_dynamic=True,
                                                      nearest_neighbor_upsampling=True))
                     if (i_h, i_w) in self._tiles_back:
                         self._tiles_back[(i_h, i_w)].detach_item()
