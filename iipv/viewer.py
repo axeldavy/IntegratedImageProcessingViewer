@@ -8,7 +8,6 @@ import numpy as np
 import threading
 import time
 import traceback
-from .image_preloader import ImagePreloader
 
 from concurrent.futures import ThreadPoolExecutor
 
