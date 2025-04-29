@@ -601,8 +601,8 @@ class ViewerWindow(dcg.Window):
         
         # Add editor components with navigation
         with dcg.HorizontalLayout(context, parent=self.transform_popup):
-            dcg.Button(context, arrow=True, direction=dcg.ButtonDirection.LEFT, callback=self.prev_transform)
-            dcg.Button(context, arrow=True, direction=dcg.ButtonDirection.RIGHT, callback=self.next_transform)
+            dcg.Button(context, arrow=dcg.ButtonDirection.LEFT, callback=self.prev_transform)
+            dcg.Button(context, arrow=dcg.ButtonDirection.RIGHT, callback=self.next_transform)
             dcg.Button(context, label="Reset", callback=self.reset_transform)
         
         
