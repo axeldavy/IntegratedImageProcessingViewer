@@ -52,4 +52,4 @@ C.viewport.initialize(vsync=True,
                       title="Just a demo")
 
 while C.running:
-    C.viewport.render_frame(can_skip_presenting=True)
+    C.viewport.render_frame()

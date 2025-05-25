@@ -59,8 +59,7 @@ def main():
 
     ViewerWindow(C, [paths], [num_images], [reader], primary=True, no_bring_to_front_on_focus=True)
     while C.running:
-        # can_skip_presenting: no GPU re-rendering on input that has no impact (such as mouse motion) 
-        C.viewport.render_frame(can_skip_presenting=True)
+        C.viewport.render_frame()
 
 if __name__ == '__main__':
     main()
