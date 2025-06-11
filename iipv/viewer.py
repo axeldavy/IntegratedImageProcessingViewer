@@ -484,7 +484,7 @@ class ViewerElement(dcg.Plot):
         self.width = -1
         self.height = -1
         # Remove empty borders
-        self.theme = dcg.ThemeStyleImPlot(self.context, PlotPadding=(0, 0))
+        self.theme = dcg.ThemeStyleImPlot(self.context, plot_padding=(0, 0))
         # Custom fields
         self.paths = paths
         self.num_images = num_paths
@@ -633,8 +633,8 @@ class ViewerWindow(dcg.Window):
         # Theme and handlers setup
         self.theme = \
             dcg.ThemeStyleImGui(context,
-                                WindowPadding=(0, 0),
-                                WindowBorderSize=0)
+                                window_padding=(0, 0),
+                                window_border_size=0)
         key_handlers = \
         [
             dcg.KeyPressHandler(context, key=dcg.Key.LEFTARROW, callback=self.index_down),
