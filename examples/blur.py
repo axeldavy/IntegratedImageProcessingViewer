@@ -17,8 +17,8 @@ C = dcg.Context()
 
 noise_images = {}
 noise_std = dcg.SharedFloat(C, 0.)
-blur_width = dcg.SharedInt(C, 1)
-blur_height = dcg.SharedInt(C, 1)
+blur_width = dcg.SharedFloat(C, 1)
+blur_height = dcg.SharedFloat(C, 1)
 viewer = None
 
 def read_image_and_add_process(path):
@@ -33,7 +33,7 @@ def read_image_and_add_process(path):
         noise_images[path] = noise_image
     image = image + (noise_std.value / 255) * noise_image
     # Add blur
-    kernel = (blur_width.value, blur_height.value)
+    kernel = (int(blur_width.value), int(blur_height.value))
     image = cv2.blur(image, ksize=kernel)
     return image
 
@@ -43,9 +43,9 @@ with dcg.Window(C, primary=True):
     with dcg.ChildWindow(C, width=-200, height=0, no_newline=True, no_scrollbar=True):
         viewer = ViewerElement(C, [path], 1, read_image_and_add_process)
     with dcg.ChildWindow(C, width=0, height=0):
-        dcg.Slider(C, label="Noise std.", shareable_value=noise_std, min_value=0, max_value=50, width=100, callback=viewer.refresh_image)
-        dcg.Slider(C, label="Blur width", shareable_value=blur_width, min_value=1, format='int', max_value=10, width=100, callback=viewer.refresh_image)
-        dcg.Slider(C, label="Blur height", shareable_value=blur_height, min_value=1, format='int', max_value=10, width=100, callback=viewer.refresh_image)
+        dcg.Slider(C, label="Noise std.", shareable_value=noise_std, min_value=0, max_value=50, width=100, callback=viewer.image_viewer.refresh)
+        dcg.Slider(C, label="Blur width", shareable_value=blur_width, min_value=1, print_format="%0.f", max_value=10, width=100, callback=viewer.image_viewer.refresh)
+        dcg.Slider(C, label="Blur height", shareable_value=blur_height, min_value=1, print_format="%0.f", max_value=10, width=100, callback=viewer.image_viewer.refresh)
 
 C.viewport.initialize(vsync=True,
                       wait_for_input=True,

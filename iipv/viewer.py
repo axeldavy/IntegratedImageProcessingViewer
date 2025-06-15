@@ -474,7 +474,7 @@ class ViewerElement(dcg.Plot):
         self.Y1.no_highlight = True
         # invert Y
         self.Y1.invert = True
-        self.fit_button = 4 # we don't want that, so set to an useless button
+        self.fit_button = dcg.MouseButton.X1 # we don't want that, so set to an useless button
         self.no_title = True
         self.no_mouse_pos = True
         self.equal_aspects = True # We do really want that for images
@@ -713,7 +713,7 @@ class ViewerWindow(dcg.Window):
             for seq in self.seqs:
                 seq.transform = transform
                 seq.image_viewer.use_pixelwise_transform = self.pixelwise_transform.value
-                seq.refresh_image()
+                seq.image_viewer.refresh()
 
             # Remove any previous error message
             if isinstance(self.transform_popup.children[-1], dcg.Text):
