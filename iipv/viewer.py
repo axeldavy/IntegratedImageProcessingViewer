@@ -97,6 +97,15 @@ class ViewerElement(dcg.Plot):
         - 1, 2, 3 or 4 channels
         - uint8 or float32. If float32, the data must be normalized between 0 and 1.
         """
+        kwargs.setdefault("equal_aspects", True) # We do really want that for images
+        kwargs.setdefault("fit_button", dcg.MouseButton.X1) # We don't want that, so set to an useless button
+        kwargs.setdefault("no_frame", True)
+        kwargs.setdefault("no_legend", True)
+        kwargs.setdefault("no_menus", True)
+        kwargs.setdefault("no_mouse_pos", True)
+        kwargs.setdefault("no_title", True)
+        kwargs.setdefault("width", "fillx") # fill the whole width
+        kwargs.setdefault("height", "filly") # fill the whole height
         super().__init__(context, **kwargs)
         # Disable all plot features we don't want
         self.X1.no_label = True
@@ -115,15 +124,6 @@ class ViewerElement(dcg.Plot):
         self.Y1.no_highlight = True
         # invert Y
         self.Y1.invert = True
-        self.fit_button = dcg.MouseButton.X1 # we don't want that, so set to an useless button
-        self.no_title = True
-        self.no_mouse_pos = True
-        self.equal_aspects = True # We do really want that for images
-        self.no_frame = True
-        self.no_legend = True
-        # fit whole size available
-        self.width = -1
-        self.height = -1
         # Remove empty borders
         self.theme = dcg.ThemeStyleImPlot(self.context, plot_padding=(0, 0))
         # Custom fields
