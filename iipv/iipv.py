@@ -1,4 +1,5 @@
 import argparse
+from collections.abc import Sequence
 import dearcygui as dcg
 import imageio
 from natsort import natsorted
@@ -7,7 +8,7 @@ from .viewer import ViewerWindow
 from .readers import SeriesReader
 import math
 
-def find_all_images(path):
+def find_all_images(path) -> Sequence[str]:
     """
     Report all files at path which
     we are supposed to be able to read
@@ -28,14 +29,14 @@ def find_all_images(path):
                 files.append(item.path)
     return files
 
-def sort_all_files(files):
+def sort_all_files(files) -> Sequence[str]:
     """
     We do not just sort based on the string, as 
     we want prefix_2.ext to be before prefix_10.ext
     """
     return natsorted(files)
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('indir', help=('Input directory or file'))
     args = parser.parse_args()
