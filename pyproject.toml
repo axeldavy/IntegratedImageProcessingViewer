@@ -10,7 +10,8 @@ build-backend = "setuptools.build_meta"
 name="iipv"
 version="0.0.1"
 dependencies = [
-    "dearcygui",
+    "appdirs",
+    "dearcygui>=0.1.0",
     "imageio",
     "numpy",
     "natsort"

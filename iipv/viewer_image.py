@@ -202,10 +202,15 @@ class ViewerImage(dcg.DrawingList):
         # If using a global transform, process the entire image at once
         if not(use_pixelwise_transform) and transformed_image is None:
             try:
-                assert isinstance(image, np.ndarray)
-                image = cast(NDArray, image)
-                transform = cast(Callable[[NDArray], NDArray], transform)
-                transformed_image = transform(image)
+                if isinstance(image, np.ndarray):
+                    image = cast(NDArray, image)
+                    transform = cast(Callable[[NDArray], NDArray], transform)
+                    transformed_image = transform(image)
+                else:
+                    # If image is not an ndarray, we assume it is an index
+                    # and we call the transform with the image and the tile coordinates
+                    transform = cast(Callable[[Any, int, int, int, int], NDArray | None], transform)
+                    transformed_image = transform(image, 0, 1_000_000, 0, 1_000_000)
                 with self._global_mutex:
                     self._transformed_image_back = transformed_image
             except Exception:
